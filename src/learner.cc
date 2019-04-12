@@ -122,8 +122,6 @@ struct LearnerTrainParam : public dmlc::Parameter<LearnerTrainParam> {
   // number of threads to use if OpenMP is enabled
   // if equals 0, use system default
   int nthread;
-  // flag to print out detailed breakdown of runtime
-  int debug_verbose;
   // flag to disable default metric
   int disable_default_eval_metric;
   // declare parameters
@@ -155,10 +153,6 @@ struct LearnerTrainParam : public dmlc::Parameter<LearnerTrainParam> {
         "Internal test flag");
     DMLC_DECLARE_FIELD(nthread).set_default(0).describe(
         "Number of threads to use.");
-    DMLC_DECLARE_FIELD(debug_verbose)
-        .set_lower_bound(0)
-        .set_default(0)
-        .describe("flag to print out detailed breakdown of runtime");
     DMLC_DECLARE_FIELD(disable_default_eval_metric)
         .set_default(0)
         .describe("flag to disable default metric. Set to >0 to disable");
@@ -184,19 +178,20 @@ class LearnerImpl : public Learner {
   static void AssertGPUSupport() {
 #ifndef XGBOOST_USE_CUDA
     LOG(FATAL) << "XGBoost version not compiled with GPU support.";
-#endif
+#endif  // XGBOOST_USE_CUDA
   }
 
 
   /*! \brief Map `tree_method` parameter to `updater` parameter */
   void ConfigureUpdaters() {
     // This method is not applicable to non-tree learners
-    if (cfg_.count("booster") > 0 && cfg_.at("booster") != "gbtree") {
+    if (cfg_.find("booster") != cfg_.cend() &&
+        (cfg_.at("booster") != "gbtree" && cfg_.at("booster") != "dart")) {
       return;
     }
     // `updater` parameter was manually specified
     if (cfg_.count("updater") > 0) {
-      LOG(CONSOLE) << "DANGER AHEAD: You have manually specified `updater` "
+      LOG(WARNING) << "DANGER AHEAD: You have manually specified `updater` "
                       "parameter. The `tree_method` parameter will be ignored. "
                       "Incorrect sequence of updaters will produce undefined "
                       "behavior. For common uses, we recommend using "
@@ -217,8 +212,9 @@ class LearnerImpl : public Learner {
       cfg_["updater"] = "grow_colmaker,prune";
       break;
      case TreeMethod::kHist:
-      LOG(CONSOLE) << "Tree method is selected to be 'hist', which uses a "
-                      "single updater grow_quantile_histmaker.";
+      LOG(INFO) <<
+          "Tree method is selected to be 'hist', which uses a "
+          "single updater grow_quantile_histmaker.";
       cfg_["updater"] = "grow_quantile_histmaker";
       break;
      case TreeMethod::kGPUExact:
@@ -245,8 +241,10 @@ class LearnerImpl : public Learner {
       const std::vector<std::pair<std::string, std::string> >& args) override {
     // add to configurations
     tparam_.InitAllowUnknown(args);
-    monitor_.Init("Learner", tparam_.debug_verbose);
+    ConsoleLogger::Configure(args.cbegin(), args.cend());
+    monitor_.Init("Learner");
     cfg_.clear();
+
     for (const auto& kv : args) {
       if (kv.first == "eval_metric") {
         // check duplication
@@ -270,7 +268,6 @@ class LearnerImpl : public Learner {
     if (tparam_.dsplit == DataSplitMode::kAuto && rabit::IsDistributed()) {
       tparam_.dsplit = DataSplitMode::kRow;
     }
-
     if (cfg_.count("num_class") != 0) {
       cfg_["num_output_group"] = cfg_["num_class"];
       if (atoi(cfg_["num_class"].c_str()) > 1 && cfg_.count("objective") == 0) {
@@ -309,6 +306,10 @@ class LearnerImpl : public Learner {
     }
     if (obj_ != nullptr) {
       obj_->Configure(cfg_.begin(), cfg_.end());
+    }
+
+    for (auto& p_metric : metrics_) {
+      p_metric->Configure(cfg_.begin(), cfg_.end());
     }
   }
 
@@ -386,7 +387,7 @@ class LearnerImpl : public Learner {
             cfg_["predictor"] = "cpu_predictor";
             kv.second = "cpu_predictor";
           }
-#endif
+#endif  // XGBOOST_USE_CUDA
         }
       }
       attributes_ =
@@ -407,6 +408,10 @@ class LearnerImpl : public Learner {
     cfg_["num_class"] = common::ToString(mparam_.num_class);
     cfg_["num_feature"] = common::ToString(mparam_.num_feature);
     obj_->Configure(cfg_.begin(), cfg_.end());
+
+    for (auto& p_metric : metrics_) {
+      p_metric->Configure(cfg_.begin(), cfg_.end());
+    }
   }
 
   // rabit save model to rabit checkpoint
@@ -469,12 +474,16 @@ class LearnerImpl : public Learner {
 
   void UpdateOneIter(int iter, DMatrix* train) override {
     monitor_.Start("UpdateOneIter");
+
+    // TODO(trivialfis): Merge the duplicated code with BoostOneIter
     CHECK(ModelInitialized())
         << "Always call InitModel or LoadModel before update";
     if (tparam_.seed_per_iteration || rabit::IsDistributed()) {
       common::GlobalRandom().seed(tparam_.seed * kRandSeedMagic + iter);
     }
+    this->ValidateDMatrix(train);
     this->PerformTreeMethodHeuristic(train);
+
     monitor_.Start("PredictRaw");
     this->PredictRaw(train, &preds_);
     monitor_.Stop("PredictRaw");
@@ -488,10 +497,15 @@ class LearnerImpl : public Learner {
   void BoostOneIter(int iter, DMatrix* train,
                     HostDeviceVector<GradientPair>* in_gpair) override {
     monitor_.Start("BoostOneIter");
+
+    CHECK(ModelInitialized())
+        << "Always call InitModel or LoadModel before boost.";
     if (tparam_.seed_per_iteration || rabit::IsDistributed()) {
       common::GlobalRandom().seed(tparam_.seed * kRandSeedMagic + iter);
     }
+    this->ValidateDMatrix(train);
     this->PerformTreeMethodHeuristic(train);
+
     gbm_->DoBoost(train, in_gpair);
     monitor_.Stop("BoostOneIter");
   }
@@ -503,13 +517,14 @@ class LearnerImpl : public Learner {
     os << '[' << iter << ']' << std::setiosflags(std::ios::fixed);
     if (metrics_.size() == 0 && tparam_.disable_default_eval_metric <= 0) {
       metrics_.emplace_back(Metric::Create(obj_->DefaultEvalMetric()));
+      metrics_.back()->Configure(cfg_.begin(), cfg_.end());
     }
     for (size_t i = 0; i < data_sets.size(); ++i) {
       this->PredictRaw(data_sets[i], &preds_);
       obj_->EvalTransform(&preds_);
       for (auto& ev : metrics_) {
         os << '\t' << data_names[i] << '-' << ev->Name() << ':'
-           << ev->Eval(preds_.ConstHostVector(), data_sets[i]->Info(),
+           << ev->Eval(preds_, data_sets[i]->Info(),
                        tparam_.dsplit == DataSplitMode::kRow);
       }
     }
@@ -553,7 +568,7 @@ class LearnerImpl : public Learner {
     this->PredictRaw(data, &preds_);
     obj_->EvalTransform(&preds_);
     return std::make_pair(metric,
-                          ev->Eval(preds_.ConstHostVector(), data->Info(),
+                          ev->Eval(preds_, data->Info(),
                                    tparam_.dsplit == DataSplitMode::kRow));
   }
 
@@ -592,8 +607,8 @@ class LearnerImpl : public Learner {
     }
 
     const TreeMethod current_tree_method = tparam_.tree_method;
+
     if (rabit::IsDistributed()) {
-      /* Choose tree_method='approx' when distributed training is activated */
       CHECK(tparam_.dsplit != DataSplitMode::kAuto)
         << "Precondition violated; dsplit cannot be 'auto' in distributed mode";
       if (tparam_.dsplit == DataSplitMode::kCol) {
@@ -603,18 +618,18 @@ class LearnerImpl : public Learner {
       }
       switch (current_tree_method) {
        case TreeMethod::kAuto:
-        LOG(CONSOLE) << "Tree method is automatically selected to be 'approx' "
-                        "for distributed training.";
+        LOG(WARNING) <<
+            "Tree method is automatically selected to be 'approx' "
+            "for distributed training.";
         break;
        case TreeMethod::kApprox:
+       case TreeMethod::kHist:
         // things are okay, do nothing
         break;
        case TreeMethod::kExact:
-       case TreeMethod::kHist:
-        LOG(CONSOLE) << "Tree method was set to be '"
-                     << (current_tree_method == TreeMethod::kExact ?
-                        "exact" : "hist")
-                     << "', but only 'approx' is available for distributed "
+        LOG(CONSOLE) << "Tree method was set to be "
+                     << "exact"
+                     << "', but only 'approx' and 'hist' is available for distributed "
                         "training. The `tree_method` parameter is now being "
                         "changed to 'approx'";
         break;
@@ -626,19 +641,27 @@ class LearnerImpl : public Learner {
         LOG(FATAL) << "Unknown tree_method ("
                    << static_cast<int>(current_tree_method) << ") detected";
       }
-      tparam_.tree_method = TreeMethod::kApprox;
+      if (current_tree_method != TreeMethod::kHist) {
+        LOG(CONSOLE) << "Tree method is automatically selected to be 'approx'"
+                        " for distributed training.";
+        tparam_.tree_method = TreeMethod::kApprox;
+      } else {
+        LOG(CONSOLE) << "Tree method is specified to be 'hist'"
+                        " for distributed training.";
+        tparam_.tree_method = TreeMethod::kHist;
+      }
     } else if (!p_train->SingleColBlock()) {
       /* Some tree methods are not available for external-memory DMatrix */
       switch (current_tree_method) {
        case TreeMethod::kAuto:
-        LOG(CONSOLE) << "Tree method is automatically set to 'approx' "
+        LOG(WARNING) << "Tree method is automatically set to 'approx' "
                         "since external-memory data matrix is used.";
         break;
        case TreeMethod::kApprox:
         // things are okay, do nothing
         break;
        case TreeMethod::kExact:
-        LOG(CONSOLE) << "Tree method was set to be 'exact', "
+        LOG(WARNING) << "Tree method was set to be 'exact', "
                         "but currently we are only able to proceed with "
                         "approximate algorithm ('approx') because external-"
                         "memory data matrix is used.";
@@ -659,7 +682,7 @@ class LearnerImpl : public Learner {
     } else if (p_train->Info().num_row_ >= (4UL << 20UL)
                && current_tree_method == TreeMethod::kAuto) {
       /* Choose tree_method='approx' automatically for large data matrix */
-      LOG(CONSOLE) << "Tree method is automatically selected to be "
+      LOG(WARNING) << "Tree method is automatically selected to be "
                       "'approx' for faster speed. To use old behavior "
                       "(exact greedy algorithm on single machine), "
                       "set tree_method to 'exact'.";
@@ -696,6 +719,8 @@ class LearnerImpl : public Learner {
     if (num_feature > mparam_.num_feature) {
       mparam_.num_feature = num_feature;
     }
+    CHECK_NE(mparam_.num_feature, 0)
+        << "0 feature is supplied.  Are you using raw Booster interface?";
     // setup
     cfg_["num_feature"] = common::ToString(mparam_.num_feature);
     CHECK(obj_ == nullptr && gbm_ == nullptr);
@@ -718,6 +743,19 @@ class LearnerImpl : public Learner {
     CHECK(gbm_ != nullptr)
         << "Predict must happen after Load or InitModel";
     gbm_->PredictBatch(data, out_preds, ntree_limit);
+  }
+
+  void ValidateDMatrix(DMatrix* p_fmat) {
+    MetaInfo const& info = p_fmat->Info();
+    auto const& weights = info.weights_.HostVector();
+    if (info.group_ptr_.size() != 0 && weights.size() != 0) {
+      CHECK(weights.size() == info.group_ptr_.size() - 1)
+          << "\n"
+          << "weights size: " << weights.size()            << ", "
+          << "groups size: "  << info.group_ptr_.size() -1 << ", "
+          << "num rows: "     << p_fmat->Info().num_row_   << "\n"
+          << "Number of weights should be equal to number of groups in ranking task.";
+    }
   }
 
   // model parameter

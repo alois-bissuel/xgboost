@@ -35,7 +35,6 @@ TEST(gpu_predictor, Test) {
 
   std::vector<std::unique_ptr<RegTree>> trees;
   trees.push_back(std::unique_ptr<RegTree>(new RegTree()));
-  trees.back()->InitModel();
   (*trees.back())[0].SetLeaf(1.5f);
   (*trees.back()).Stat(0).sum_hess = 1.0f;
   gbm::GBTreeModel model(0.5);
@@ -91,6 +90,7 @@ TEST(gpu_predictor, Test) {
   delete dmat;
 }
 
+#if defined(XGBOOST_USE_NCCL)
 // Test whether pickling preserves predictor parameters
 TEST(gpu_predictor, MGPU_PicklingTest) {
   int ngpu;
@@ -164,7 +164,9 @@ TEST(gpu_predictor, MGPU_PicklingTest) {
 
   CheckCAPICall(XGBoosterFree(bst2));
 }
+#endif  // defined(XGBOOST_USE_NCCL)
 
+#if defined(XGBOOST_USE_NCCL)
 // multi-GPU predictor test
 TEST(gpu_predictor, MGPU_Test) {
   std::unique_ptr<Predictor> gpu_predictor =
@@ -181,7 +183,6 @@ TEST(gpu_predictor, MGPU_Test) {
 
     std::vector<std::unique_ptr<RegTree>> trees;
     trees.push_back(std::unique_ptr<RegTree>(new RegTree()));
-    trees.back()->InitModel();
     (*trees.back())[0].SetLeaf(1.5f);
     (*trees.back()).Stat(0).sum_hess = 1.0f;
     gbm::GBTreeModel model(0.5);
@@ -204,6 +205,6 @@ TEST(gpu_predictor, MGPU_Test) {
     delete dmat;
   }
 }
-
+#endif  // defined(XGBOOST_USE_NCCL)
 }  // namespace predictor
 }  // namespace xgboost

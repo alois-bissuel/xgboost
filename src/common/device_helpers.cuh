@@ -19,9 +19,11 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "timer.h"
 
 #ifdef XGBOOST_USE_NCCL
 #include "nccl.h"
+#include "../common/io.h"
 #endif
 
 // Uncomment to enable
@@ -377,6 +379,11 @@ class DVec2 {
   DVec<T> &D2() { return d2_; }
 
   T *Current() { return buff_.Current(); }
+  xgboost::common::Span<T> CurrentSpan() {
+    return xgboost::common::Span<T>{
+      buff_.Current(),
+      static_cast<typename xgboost::common::Span<T>::index_type>(Size())};
+  }
 
   DVec<T> &CurrentDVec() { return buff_.selector == 0 ? D1() : D2(); }
 
@@ -479,7 +486,7 @@ class BulkAllocator {
   }
 
   template <typename... Args>
-  void Allocate(int device_idx, bool silent, Args... args) {
+  void Allocate(int device_idx, Args... args) {
     size_t size = GetSizeBytes(args...);
 
     char *ptr = AllocateDevice(device_idx, size, MemoryT);
@@ -790,7 +797,7 @@ typename std::iterator_traits<T>::value_type SumReduction(
 template <typename T, int BlkDim = 256, int ItemsPerThread = 4>
 void FillConst(int device_idx, T *out, int len, T def) {
   dh::LaunchN<ItemsPerThread, BlkDim>(device_idx, len,
-                                       [=] __device__(int i) { out[i] = def; });
+                                      [=] __device__(int i) { out[i] = def; });
 }
 
 /**
@@ -840,14 +847,20 @@ void Gather(int device_idx, T *out, const T *in, const int *instId, int nVals) {
  */
 
 class AllReducer {
-  bool initialised;
+  bool initialised_;
+  size_t allreduce_bytes_;  // Keep statistics of the number of bytes communicated
+  size_t allreduce_calls_;  // Keep statistics of the number of reduce calls
 #ifdef XGBOOST_USE_NCCL
   std::vector<ncclComm_t> comms;
   std::vector<cudaStream_t> streams;
-  std::vector<int> device_ordinals;
+  std::vector<int> device_ordinals;  // device id from CUDA
+  std::vector<int> device_counts;  // device count from CUDA
+  ncclUniqueId id;
 #endif
+
  public:
-  AllReducer() : initialised(false) {}
+  AllReducer() : initialised_(false), allreduce_bytes_(0),
+                 allreduce_calls_(0) {}
 
   /**
    * \fn  void Init(const std::vector<int> &device_ordinals)
@@ -860,17 +873,45 @@ class AllReducer {
 
   void Init(const std::vector<int> &device_ordinals) {
 #ifdef XGBOOST_USE_NCCL
+    /** \brief this >monitor . init. */
     this->device_ordinals = device_ordinals;
-    comms.resize(device_ordinals.size());
-    dh::safe_nccl(ncclCommInitAll(comms.data(),
-                                  static_cast<int>(device_ordinals.size()),
-                                  device_ordinals.data()));
-    streams.resize(device_ordinals.size());
-    for (size_t i = 0; i < device_ordinals.size(); i++) {
-      safe_cuda(cudaSetDevice(device_ordinals[i]));
-      safe_cuda(cudaStreamCreate(&streams[i]));
+    this->device_counts.resize(rabit::GetWorldSize());
+    this->comms.resize(device_ordinals.size());
+    this->streams.resize(device_ordinals.size());
+    this->id = GetUniqueId();
+
+    device_counts.at(rabit::GetRank()) = device_ordinals.size();
+    for (size_t i = 0; i < device_counts.size(); i++) {
+      int dev_count = device_counts.at(i);
+      rabit::Allreduce<rabit::op::Sum, int>(&dev_count, 1);
+      device_counts.at(i) = dev_count;
     }
-    initialised = true;
+
+    int nccl_rank = 0;
+    int nccl_rank_offset = std::accumulate(device_counts.begin(),
+                             device_counts.begin() + rabit::GetRank(), 0);
+    int nccl_nranks = std::accumulate(device_counts.begin(),
+                        device_counts.end(), 0);
+    nccl_rank += nccl_rank_offset;
+    
+    GroupStart();
+    for (size_t i = 0; i < device_ordinals.size(); i++) {
+      int dev = device_ordinals.at(i);
+      dh::safe_cuda(cudaSetDevice(dev));
+      dh::safe_nccl(ncclCommInitRank(
+        &comms.at(i),
+        nccl_nranks, id, 
+        nccl_rank));
+
+      nccl_rank++;
+    }
+    GroupEnd();
+
+    for (size_t i = 0; i < device_ordinals.size(); i++) {
+      safe_cuda(cudaSetDevice(device_ordinals.at(i)));
+      safe_cuda(cudaStreamCreate(&streams.at(i)));
+    }
+    initialised_ = true;
 #else
     CHECK_EQ(device_ordinals.size(), 1)
         << "XGBoost must be compiled with NCCL to use more than one GPU.";
@@ -878,13 +919,18 @@ class AllReducer {
   }
   ~AllReducer() {
 #ifdef XGBOOST_USE_NCCL
-    if (initialised) {
+    if (initialised_) {
       for (auto &stream : streams) {
         dh::safe_cuda(cudaStreamDestroy(stream));
       }
       for (auto &comm : comms) {
         ncclCommDestroy(comm);
       }
+    }
+    if (xgboost::ConsoleLogger::ShouldLog(xgboost::ConsoleLogger::LV::kDebug)) {
+      LOG(CONSOLE) << "======== NCCL Statistics========";
+      LOG(CONSOLE) << "AllReduce calls: " << allreduce_calls_;
+      LOG(CONSOLE) << "AllReduce total MB communicated: " << allreduce_bytes_/1000000;
     }
 #endif
   }
@@ -920,11 +966,42 @@ class AllReducer {
   void AllReduceSum(int communication_group_idx, const double *sendbuff,
                     double *recvbuff, int count) {
 #ifdef XGBOOST_USE_NCCL
-    CHECK(initialised);
+    CHECK(initialised_);
     dh::safe_cuda(cudaSetDevice(device_ordinals.at(communication_group_idx)));
     dh::safe_nccl(ncclAllReduce(sendbuff, recvbuff, count, ncclDouble, ncclSum,
                                 comms.at(communication_group_idx),
                                 streams.at(communication_group_idx)));
+    if(communication_group_idx == 0)
+    {
+      allreduce_bytes_ += count * sizeof(double);
+      allreduce_calls_ += 1;
+    }
+#endif
+  }
+
+  /**
+   * \brief Allreduce. Use in exactly the same way as NCCL but without needing
+   * streams or comms.
+   *
+   * \param communication_group_idx Zero-based index of the communication group.
+   * \param sendbuff                The sendbuff.
+   * \param recvbuff                The recvbuff.
+   * \param count                   Number of elements.
+   */
+
+  void AllReduceSum(int communication_group_idx, const float *sendbuff,
+                    float *recvbuff, int count) {
+#ifdef XGBOOST_USE_NCCL
+    CHECK(initialised_);
+    dh::safe_cuda(cudaSetDevice(device_ordinals.at(communication_group_idx)));
+    dh::safe_nccl(ncclAllReduce(sendbuff, recvbuff, count, ncclFloat, ncclSum,
+                                comms.at(communication_group_idx),
+                                streams.at(communication_group_idx)));
+    if(communication_group_idx == 0)
+    {
+      allreduce_bytes_ += count * sizeof(float);
+      allreduce_calls_ += 1;
+    }
 #endif
   }
 
@@ -942,7 +1019,7 @@ class AllReducer {
   void AllReduceSum(int communication_group_idx, const int64_t *sendbuff,
                     int64_t *recvbuff, int count) {
 #ifdef XGBOOST_USE_NCCL
-    CHECK(initialised);
+    CHECK(initialised_);
 
     dh::safe_cuda(cudaSetDevice(device_ordinals[communication_group_idx]));
     dh::safe_nccl(ncclAllReduce(sendbuff, recvbuff, count, ncclInt64, ncclSum,
@@ -958,12 +1035,35 @@ class AllReducer {
    */
   void Synchronize() {
 #ifdef XGBOOST_USE_NCCL
-    for (int i = 0; i < device_ordinals.size(); i++) {
+    for (size_t i = 0; i < device_ordinals.size(); i++) {
       dh::safe_cuda(cudaSetDevice(device_ordinals[i]));
       dh::safe_cuda(cudaStreamSynchronize(streams[i]));
     }
 #endif
+  };
+
+#ifdef XGBOOST_USE_NCCL
+  /**
+   * \fn  ncclUniqueId GetUniqueId()
+   *
+   * \brief Gets the Unique ID from NCCL to be used in setting up interprocess
+   * communication
+   *
+   * \return the Unique ID
+   */
+  ncclUniqueId GetUniqueId() {
+    static const int RootRank = 0;
+    ncclUniqueId id;
+    if (rabit::GetRank() == RootRank) {
+      dh::safe_nccl(ncclGetUniqueId(&id));
+    }
+    rabit::Broadcast(
+      (void*)&id,
+      (size_t)sizeof(ncclUniqueId),
+      (int)RootRank);
+    return id;
   }
+#endif
 };
 
 class SaveCudaContext {
@@ -991,27 +1091,6 @@ class SaveCudaContext {
 
 /**
  * \brief Executes some operation on each element of the input vector, using a
- * single controlling thread for each element.
- *
- * \tparam  T       Generic type parameter.
- * \tparam  FunctionT  Type of the function t.
- * \param shards  The shards.
- * \param f       The func_t to process.
- */
-
-template <typename T, typename FunctionT>
-void ExecuteShards(std::vector<T> *shards, FunctionT f) {
-  SaveCudaContext {
-    [&](){
-#pragma omp parallel for schedule(static, 1) if (shards->size() > 1)
-      for (int shard = 0; shard < shards->size(); ++shard) {
-        f(shards->at(shard));
-      }
-    }};
-}
-
-/**
- * \brief Executes some operation on each element of the input vector, using a
  * single controlling thread for each element. In addition, passes the shard index
  * into the function.
  *
@@ -1023,13 +1102,13 @@ void ExecuteShards(std::vector<T> *shards, FunctionT f) {
 
 template <typename T, typename FunctionT>
 void ExecuteIndexShards(std::vector<T> *shards, FunctionT f) {
-  SaveCudaContext {
-    [&](){
-#pragma omp parallel for schedule(static, 1) if (shards->size() > 1)
-      for (int shard = 0; shard < shards->size(); ++shard) {
-        f(shard, shards->at(shard));
-      }
-    }};
+  SaveCudaContext{[&]() {
+    const long shards_size = static_cast<long>(shards->size());
+#pragma omp parallel for schedule(static, 1) if (shards_size > 1)
+    for (long shard = 0; shard < shards_size; ++shard) {
+      f(shard, shards->at(shard));
+    }
+  }};
 }
 
 /**
